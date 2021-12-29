@@ -7,18 +7,6 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
-
-# Map from host-port:internal port
-#
-# This mostly just shows all the ports that are available to the host system, if you want
-# to change these you must restart the docker-compose cluster.
-x-port-mappings:
-  - &kafka-internal ${KAFKA_PORT:-9092}
-  - &kafka-external 9093:9093
-  - &schema-registry ${SR_PORT:-8081:8081}
-  - &grafana 3000:3000
-  - &prometheus 9090
-
 version: '3.7'
 services:
   zookeeper:
@@ -28,8 +16,7 @@ services:
   kafka:
     image: confluentinc/cp-enterprise-kafka:5.5.4
     ports:
-      - *kafka-internal
-      - *kafka-external
+      - 9092:9092
     depends_on: [zookeeper]
     environment:
       - KAFKA_ZOOKEEPER_CONNECT=zookeeper:2181
@@ -41,16 +28,10 @@ services:
       - KAFKA_LOG_RETENTION_HOURS=-1
       - KAFKA_NUM_PARTITIONS=1
       - KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1
-      #- KAFKA_LOG_CLEANUP_POLICY=compact
-      - CONFLUENT_METRICS_REPORTER_BOOTSTRAP_SERVERS=kafka:9092
-      - CONFLUENT_METRICS_REPORTER_TOPIC_REPLICAS=1
-      # To avoid race condition with control-center
-      - CONFLUENT_METRICS_REPORTER_TOPIC_CREATE=false
-      - KAFKA_JMX_PORT=9991
   schema-registry:
     image: confluentinc/cp-schema-registry:5.5.4
     ports:
-      - *schema-registry
+      - 8081:8081
     environment:
      - SCHEMA_REGISTRY_KAFKASTORE_CONNECTION_URL=zookeeper:2181
      - SCHEMA_REGISTRY_HOST_NAME=schema-registry

@@ -14,102 +14,29 @@ import json
 import os
 import sys
 import time
-from pathlib import Path
-from threading import Thread
 from typing import NamedTuple
 
-import psutil
+from docker.models.containers import Container
+import docker
 import pg8000
 import requests
 from pg8000.exceptions import DatabaseError
 
-from materialize import mzbuild, spawn
-
-MZ_ROOT = os.environ["MZ_ROOT"]
+from materialize import ROOT, mzbuild, spawn
 
 
-def wait_for_confluent() -> None:
+def wait_for_confluent(host: str) -> None:
+    url = f"http://{host}:8081/subjects"
     while True:
         try:
-            r = requests.get("http://confluent:8081/subjects")
+            print(f"Checking if schema registry at {url} is accessible...")
+            r = requests.get(url)
             if r.status_code == 200:
+                print("Schema registry is ready")
                 return
-        except requests.exceptions.ConnectionError:
-            continue
-
-
-def generate_data(n_records: int, distribution: str) -> None:
-    repo = mzbuild.Repository(Path(MZ_ROOT))
-    deps = repo.resolve_dependencies([repo.images["kafka-avro-generator"]])
-    image = deps["kafka-avro-generator"]
-    deps.acquire()
-
-    stdout = open("gen_data.out", "a")
-    stderr = open("gen_data.err", "a")
-
-    spawn.runv(
-        args=[
-            "docker",
-            "run",
-            "--network",
-            "host",
-            image.spec(),
-            "-n",
-            str(n_records),
-            "-b",
-            "confluent:9093",
-            "-r",
-            "http://confluent:8081",
-            "-t",
-            "bench_data",
-            "-d",
-            distribution,
-        ],
-        stdout=stdout,
-        stderr=stderr,
-        print_to=sys.stderr,
-    )
-
-
-def launch_mz() -> None:
-    # We can't run bin/mzimage directly,
-    # because we need to pass in various flags;
-    # notably `--cidfile` to get the container ID.
-    # Otherwise, this all does the same thing as `bin/mzimage materialized`
-    repo = mzbuild.Repository(Path(MZ_ROOT))
-    deps = repo.resolve_dependencies([repo.images["materialized"]])
-    image = deps["materialized"]
-    deps.acquire()
-
-    stdout = open("build_mz.out", "a")
-    stderr = open("build_mz.err", "a")
-
-    spawn.runv(
-        args=[
-            "docker",
-            "run",
-            "--network",
-            "host",
-            "--cidfile",
-            "docker.cid",
-            image.spec(),
-        ],
-        stdout=stdout,
-        stderr=stderr,
-        print_to=sys.stderr,
-    )
-
-
-def mz_proc(cid: str) -> psutil.Process:
-    docker_info = spawn.capture(["docker", "inspect", cid])
-    docker_info = json.loads(docker_info)
-    docker_init_pid = int(docker_info[0]["State"]["Pid"])
-    docker_init = psutil.Process(docker_init_pid)
-    for child in docker_init.children(recursive=True):
-        if child.name() == "materialized":
-            assert isinstance(child, psutil.Process)
-            return child
-    raise RuntimeError("Couldn't find materialized pid")
+        except requests.exceptions.ConnectionError as e:
+            print(e)
+            time.sleep(5)
 
 
 class PrevStats(NamedTuple):
@@ -118,10 +45,9 @@ class PrevStats(NamedTuple):
     system_cpu: float
 
 
-def print_stats(cid: str, prev: PrevStats) -> PrevStats:
-    proc = mz_proc(cid)
-    memory = proc.memory_info()
-    cpu = proc.cpu_times()
+def print_stats(container: Container, prev: PrevStats) -> PrevStats:
+    stats = json.loads(container.stats(stream=False))
+    print(stats)
     new_prev = PrevStats(time.time(), cpu.user, cpu.system)
     print(
         f"{memory.rss},{memory.vms},{new_prev.user_cpu - prev.user_cpu},{new_prev.system_cpu - prev.system_cpu},{new_prev.wall_time - prev.wall_time}"
@@ -130,8 +56,12 @@ def print_stats(cid: str, prev: PrevStats) -> PrevStats:
 
 
 def main() -> None:
-    os.chdir(MZ_ROOT)
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--confluent-host",
+        default="confluent",
+        help="The hostname of a machine running the Confluent Platform",
+    )
     parser.add_argument(
         "-n",
         "--trials",
@@ -153,60 +83,67 @@ def main() -> None:
         type=str,
         help="Distribution to use in kafka-avro-generator",
     )
-    ns = parser.parse_args()
+    args = parser.parse_args()
 
-    wait_for_confluent()
-    # We need to temporarily redirect stdout to stderr,
-    # because, although recent versions of the mz repository
-    # make sure mzbuild only writes to stderr here,
-    # we might want to run this against older versions that don't.
-    #
-    # This will not work correctly
-    # if stdout is buffered, but we invoke this script
-    # with python3 -u, so that's fine.
-    #
-    # We have to do this the POSIX way here, rather than with
-    # `contextlib.redirect_stdout`, because that only affects native
-    # Python code, not e.g. spawned processes
-    old_stdout = os.dup(1)
-    os.dup2(2, 1)
+    os.chdir(ROOT)
+    repo = mzbuild.Repository(ROOT)
 
-    mz_launcher = Thread(target=launch_mz, daemon=True)
-    mz_launcher.start()
+    if args.confluent_host == "localhost" and sys.platform == "darwin":
+        docker_confluent_host = "host.docker.internal"
+    else:
+        docker_confluent_host = "localhost"
 
-    kgen_launcher = Thread(target=generate_data, args=[ns.records, ns.distribution])
-    kgen_launcher.start()
-    kgen_launcher.join()
+    wait_for_confluent(args.confluent_host)
 
-    cid_path = Path("docker.cid")
-    cid = ""
-    while not cid_path.exists():
-        time.sleep(1)
-    while not cid:
-        with open(cid_path) as f:
-            cid = f.read()
-    os.dup2(old_stdout, 1)
-    os.remove(cid_path)
+    images = ["kafka-avro-generator", "materialized"]
+    deps = repo.resolve_dependencies([repo.images[name] for name in images])
+    deps.acquire()
+
+    docker_client = docker.from_env()
+
+    mz_container = docker_client.containers.run(
+        deps["materialized"].spec(), detach=True, network_mode="host",
+    )
+
+    loadgen_container = docker_client.containers.run(
+        deps["kafka-avro-generator"].spec(),
+        [
+            "-n",
+            str(args.records),
+            "-b",
+            f"{docker_confluent_host}:9092",
+            "-r",
+            f"http://{docker_confluent_host}:8081",
+            "-t",
+            "bench_data",
+            "-d",
+            args.distribution,
+        ],
+        detach=True,
+        network_mode="host",
+    )
+
     conn = pg8000.connect(host="localhost", port=6875, user="materialize")
     cur = conn.cursor()
+    cur.execute(
+        f"""CREATE SOURCE src
+        FROM KAFKA BROKER '{args.confluent_host}:9093' TOPIC 'bench_data'
+        FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY 'http://{args.confluent_host}:8081'""")
+
     print("Rss,Vms,User Cpu,System Cpu,Wall Time")
-    cur.execute(  # type: ignore
-        "CREATE SOURCE s FROM KAFKA BROKER 'confluent:9093' TOPIC 'bench_data' FORMAT AVRO USING CONFLUENT SCHEMA REGISTRY 'http://confluent:8081'"
-    )
     prev = PrevStats(time.time(), 0.0, 0.0)
-    for _ in range(ns.trials):
-        cur.execute("DROP VIEW IF EXISTS ct")
-        cur.execute("CREATE MATERIALIZED VIEW ct AS SELECT count(*) FROM s")
+    for _ in range(args.trials):
+        cur.execute("CREATE MATERIALIZED VIEW IF NOT EXISTS ct AS SELECT count(*) FROM s")
         while True:
             try:
-                cur.execute("SELECT * FROM ct")  # type: ignore
+                cur.execute("SELECT * FROM ct")
                 n = cur.fetchone()[0]
-                if n == ns.records:
+                if n == args.records:
                     break
             except DatabaseError:
                 pass
             time.sleep(1)
-        prev = print_stats(cid, prev)
+        prev = print_stats(mz_container, prev)
 
 
 if __name__ == "__main__":
