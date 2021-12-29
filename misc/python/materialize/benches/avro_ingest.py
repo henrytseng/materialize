@@ -19,9 +19,9 @@ from threading import Thread
 from typing import NamedTuple
 
 import psutil
-import psycopg2
-import psycopg2.errors
+import pg8000
 import requests
+from pg8000.exceptions import DatabaseError
 
 from materialize import mzbuild, spawn
 
@@ -187,8 +187,7 @@ def main() -> None:
             cid = f.read()
     os.dup2(old_stdout, 1)
     os.remove(cid_path)
-    conn = psycopg2.connect("host=localhost port=6875 user=materialize")
-    conn.autocommit = True
+    conn = pg8000.connect(host="localhost", port=6875, user="materialize")
     cur = conn.cursor()
     print("Rss,Vms,User Cpu,System Cpu,Wall Time")
     cur.execute(  # type: ignore
@@ -196,18 +195,15 @@ def main() -> None:
     )
     prev = PrevStats(time.time(), 0.0, 0.0)
     for _ in range(ns.trials):
-        cur.execute("DROP VIEW IF EXISTS ct")  # type: ignore
-        cur.execute("CREATE MATERIALIZED VIEW ct AS SELECT count(*) FROM s")  # type: ignore
+        cur.execute("DROP VIEW IF EXISTS ct")
+        cur.execute("CREATE MATERIALIZED VIEW ct AS SELECT count(*) FROM s")
         while True:
             try:
                 cur.execute("SELECT * FROM ct")  # type: ignore
                 n = cur.fetchone()[0]
                 if n == ns.records:
                     break
-            except (
-                psycopg2.errors.SqlStatementNotYetComplete,
-                psycopg2.errors.InternalError,
-            ):
+            except DatabaseError:
                 pass
             time.sleep(1)
         prev = print_stats(cid, prev)
